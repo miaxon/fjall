@@ -270,8 +270,20 @@ fn worker_tick(ctx: &WorkerState) -> crate::Result<bool> {
             // NOTE: Let one worker prioritize flushing if there are pending flushes
             //
             // Disable when only 1 worker exists to avoid deadlock
-            if ctx.pool_size > 1 && ctx.worker_id == 0 {
-                ctx.sender.send(WorkerMessage::Compact(keyspace)).ok();
+            //
+            // Never wait for channel capacity here: the workers are the
+            // channel's only readers, so during shutdown a worker blocked in
+            // `send` could neither take its `Close` nor release its slot, and
+            // the database would never close (see `stop_workers`). A full
+            // channel has plenty of work in flight already; compact here
+            // instead of dropping the task.
+            if ctx.pool_size > 1
+                && ctx.worker_id == 0
+                && ctx
+                    .sender
+                    .try_send(WorkerMessage::Compact(keyspace.clone()))
+                    .is_ok()
+            {
                 return Ok(false);
             }
 
@@ -453,5 +465,50 @@ mod tests {
         stopper.join().expect("stop thread");
         assert_eq!(counter.load(Relaxed), 0);
         drop(rx);
+    }
+
+    /// Worker 0 hands compactions to the other workers, but must not wait
+    /// for channel capacity: the workers are the channel's only readers, so
+    /// during shutdown a worker blocked in `send` would never take its
+    /// `Close`. A rendezvous channel stands in for one that stays full --
+    /// `send` completes only when a reader takes the message, and there is
+    /// none -- so worker 0 has to compact by itself.
+    #[test]
+    fn compact_hand_off_does_not_block_on_a_full_channel() -> crate::Result<()> {
+        let folder = tempfile::tempdir()?;
+        let db = Database::builder(&folder)
+            .worker_threads_unchecked(0)
+            .open()?;
+        let keyspace = db.keyspace("default", KeyspaceCreateOptions::default)?;
+        keyspace.insert("a", "a")?;
+
+        let (sender, rx) = flume::bounded(0);
+        let state = WorkerState {
+            pool_size: 2,
+            worker_id: 0,
+            supervisor: db.supervisor.clone(),
+            rx: rx.clone(),
+            sender: sender.clone(),
+            stats: db.stats.clone(),
+        };
+        let tick = std::thread::spawn(move || worker_tick(&state));
+        // Completes once the worker has taken the message.
+        sender
+            .send(WorkerMessage::Compact(keyspace))
+            .expect("worker takes the compaction");
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !tick.is_finished() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "worker 0 is blocked handing off the compaction on a full channel",
+            );
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        let should_abort = tick.join().expect("worker thread")?;
+        assert!(!should_abort);
+        drop(rx);
+
+        Ok(())
     }
 }
