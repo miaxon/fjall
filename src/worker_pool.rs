@@ -117,6 +117,28 @@ impl WorkerPool {
 
         Ok(())
     }
+
+    /// Tells every worker to exit and waits until the last one has left.
+    pub fn stop(&self, active_thread_counter: &AtomicUsize) {
+        stop_workers(&self.sender, active_thread_counter);
+    }
+}
+
+/// Offers `Close` until the active thread counter reaches zero.
+///
+/// The workers are the only readers of the channel, and each of them takes
+/// exactly one `Close` before it exits, so nothing reads the channel once the
+/// last worker has taken its message. A blocking `send` here could then never
+/// be woken up: when the channel is full at that moment -- and this loop fills
+/// it by itself while a worker is slow to come back to `recv` -- the `send`
+/// waits forever and the database never closes. `try_send` keeps offering
+/// instead; a full channel already holds a `Close` for every worker that is
+/// still to come.
+fn stop_workers(sender: &flume::Sender<WorkerMessage>, active_thread_counter: &AtomicUsize) {
+    while active_thread_counter.load(Relaxed) > 0 {
+        let _ = sender.try_send(WorkerMessage::Close);
+        std::thread::sleep(std::time::Duration::from_micros(10));
+    }
 }
 
 /// Claims one slot in the active thread counter per worker, immediately before
@@ -385,5 +407,51 @@ mod tests {
 
         assert!(outcome.is_err());
         assert_eq!(counter.load(Relaxed), 0);
+    }
+
+    /// The stop loop fills the channel while the last worker is slow to come
+    /// back to `recv`; the worker then takes its one `Close` and releases its
+    /// slot only afterwards, as a preempted thread would. Nothing reads the
+    /// channel in that window, so the loop must not block on it: it would
+    /// never wake up again, and the database would never close.
+    #[test]
+    fn stop_does_not_block_on_a_full_channel() {
+        let (sender, rx) = flume::bounded(8);
+        let counter = Arc::new(AtomicUsize::new(1));
+
+        let worker = std::thread::spawn({
+            let rx = rx.clone();
+            let counter = counter.clone();
+            move || {
+                // Busy until the stop loop has filled the channel.
+                while !rx.is_full() {
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                }
+                let _ = rx.recv();
+                // Preempted before releasing the slot: long enough for the
+                // stop loop to look at the counter again and offer the next
+                // `Close` into the channel it has just refilled.
+                std::thread::sleep(std::time::Duration::from_millis(50));
+                counter.fetch_sub(1, Relaxed);
+            }
+        });
+
+        let stopper = std::thread::spawn({
+            let counter = counter.clone();
+            move || stop_workers(&sender, &counter)
+        });
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !stopper.is_finished() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "stop loop is blocked on the full worker channel",
+            );
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        worker.join().expect("worker thread");
+        stopper.join().expect("stop thread");
+        assert_eq!(counter.load(Relaxed), 0);
+        drop(rx);
     }
 }
